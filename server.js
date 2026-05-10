@@ -4,6 +4,7 @@ import http from "http";
 import cors from "cors";
 import { Server } from "socket.io";
 
+
 const PORT = Number(process.env.PORT || 8787);
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
