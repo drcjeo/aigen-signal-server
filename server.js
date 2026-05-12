@@ -13,19 +13,27 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "https://agents.aigen.domains",
   "https://aigen.domains",
   "https://api.namespace.domains",
+  "https://namespace.domains",
+  "https://www.namespace.domains",
   "http://localhost:3000",
   "http://localhost:5173",
   "http://127.0.0.1:3000",
   "http://127.0.0.1:5173",
 ];
 
+const ENV_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/*
+  Important:
+  Railway env origins are MERGED with defaults, not used as a replacement.
+  This prevents sandbox.aigen.domains from being accidentally blocked when
+  ALLOWED_ORIGINS is incomplete in Railway Variables.
+*/
 const allowedOrigins = Array.from(
-  new Set(
-    (process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-  )
+  new Set([...DEFAULT_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS])
 );
 
 const allowAllOrigins = allowedOrigins.includes("*");
@@ -45,10 +53,6 @@ const LIMITS = {
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "256kb" }));
-
-function getOrigin(req) {
-  return req.headers.origin || "";
-}
 
 function isAllowedOrigin(origin) {
   return !origin || allowAllOrigins || allowedOrigins.includes(origin);
@@ -192,7 +196,6 @@ function emitRateLimit(socket, area, result) {
 }
 
 function registerPresence(socket, payload = {}) {
-  const ip = ipForSocket(socket);
   const rl = rateLimit(`presence:${socket.id}`, LIMITS.registerPresencePerMinute);
   if (!rl.ok) return emitRateLimit(socket, "presence", rl);
 
@@ -223,6 +226,7 @@ function registerPresence(socket, payload = {}) {
 
   removeSocket(socket.id);
 
+  const ip = ipForSocket(socket);
   const wallet = String(payload.wallet || "").trim();
   const activeCanonical = canonicalDomain(payload.activeDomain || rawDomains[0]);
   const canonicalDomains = Array.from(new Set(rawDomains.map(canonicalDomain).filter(Boolean)));
@@ -322,7 +326,7 @@ function startCall(socket, payload = {}) {
   });
 
   for (const targetSocketId of targets) {
-    io.to(targetSocketId).emit("incoming-call", {
+    const invitePayload = {
       callId,
       fromDomain: call.fromDomain,
       toDomain: call.toDomain,
@@ -331,18 +335,10 @@ function startCall(socket, payload = {}) {
       room,
       mode: payload.mode || "video",
       at: Date.now(),
-    });
+    };
 
-    io.to(targetSocketId).emit("call-invite", {
-      callId,
-      fromDomain: call.fromDomain,
-      toDomain: call.toDomain,
-      fromCanonical: call.fromCanonical,
-      toCanonical: call.toCanonical,
-      room,
-      mode: payload.mode || "video",
-      at: Date.now(),
-    });
+    io.to(targetSocketId).emit("incoming-call", invitePayload);
+    io.to(targetSocketId).emit("call-invite", invitePayload);
   }
 }
 
@@ -419,17 +415,7 @@ function relayDomainMessage(socket, payload = {}) {
 
   if (!room || !text) return;
 
-  socket.to(room).emit("domain-message", {
-    fromDomain: displayDomain(fromDomain),
-    toDomain: displayDomain(toDomain),
-    fromCanonical: canonicalDomain(fromDomain),
-    toCanonical: canonicalDomain(toDomain),
-    text,
-    room,
-    at: Date.now(),
-  });
-
-  socket.to(room).emit("chat-message", {
+  const messagePayload = {
     fromDomain: displayDomain(fromDomain),
     toDomain: displayDomain(toDomain),
     fromCanonical: canonicalDomain(fromDomain),
@@ -438,26 +424,25 @@ function relayDomainMessage(socket, payload = {}) {
     message: text,
     room,
     at: Date.now(),
-  });
+  };
+
+  socket.to(room).emit("domain-message", messagePayload);
+  socket.to(room).emit("chat-message", messagePayload);
 }
 
 function endChat(socket, payload = {}) {
   const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
   if (!room) return;
 
-  socket.to(room).emit("chat-ended", {
+  const endPayload = {
     fromDomain: payload.fromDomain,
     toDomain: payload.toDomain,
     room,
     at: Date.now(),
-  });
+  };
 
-  socket.to(room).emit("end-chat", {
-    fromDomain: payload.fromDomain,
-    toDomain: payload.toDomain,
-    room,
-    at: Date.now(),
-  });
+  socket.to(room).emit("chat-ended", endPayload);
+  socket.to(room).emit("end-chat", endPayload);
 
   socket.leave(room);
 }
@@ -466,7 +451,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "aigen-domain-chat-signal-server",
-    version: "20260512-abuse-protected",
+    version: "20260512-abuse-protected-merged-origins",
   });
 });
 
@@ -474,11 +459,13 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aigen-domain-chat-signal-server",
-    version: "20260512-abuse-protected",
+    version: "20260512-abuse-protected-merged-origins",
     onlineSockets: socketProfiles.size,
     onlineDomains: domainSockets.size,
     pendingCalls: calls.size,
     allowedOrigins: allowAllOrigins ? ["*"] : allowedOrigins,
+    envAllowedOrigins: ENV_ALLOWED_ORIGINS,
+    defaultAllowedOrigins: DEFAULT_ALLOWED_ORIGINS,
     limits: LIMITS,
   });
 });
@@ -496,10 +483,30 @@ app.get("/presence/:domain", (req, res) => {
   });
 });
 
+app.get("/debug/presence", (_req, res) => {
+  const domains = [];
+
+  for (const [domain, sockets] of domainSockets.entries()) {
+    domains.push({
+      domain: displayDomain(domain),
+      canonical: domain,
+      sockets: Array.from(sockets).filter((id) => io.sockets.sockets.has(id)).length,
+    });
+  }
+
+  res.json({
+    ok: true,
+    onlineSockets: socketProfiles.size,
+    onlineDomains: domains.length,
+    domains,
+  });
+});
+
 io.use((socket, next) => {
   const origin = socket.handshake.headers.origin || "";
 
   if (!isAllowedOrigin(origin)) {
+    console.warn("[SOCKET ORIGIN BLOCKED]", origin);
     return next(new Error("origin_not_allowed"));
   }
 
@@ -507,6 +514,7 @@ io.use((socket, next) => {
   const current = ipSockets.get(ip);
 
   if (current && current.size >= LIMITS.maxConnectionsPerIp) {
+    console.warn("[SOCKET IP BLOCKED]", ip);
     return next(new Error("too_many_connections"));
   }
 
@@ -522,7 +530,7 @@ io.on("connection", (socket) => {
   socket.emit("signal-ready", {
     ok: true,
     socketId: socket.id,
-    version: "20260512-abuse-protected",
+    version: "20260512-abuse-protected-merged-origins",
   });
 
   socket.on("register-presence", (payload = {}) => registerPresence(socket, payload));
@@ -610,4 +618,5 @@ setInterval(() => {
 server.listen(PORT, () => {
   console.log(`AIGEN signal server listening on :${PORT}`);
   console.log("Allowed origins:", allowAllOrigins ? "*" : allowedOrigins.join(", "));
+  console.log("Env origins:", ENV_ALLOWED_ORIGINS.join(", ") || "(none)");
 });
