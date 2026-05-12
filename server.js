@@ -19,27 +19,45 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5173",
 ];
 
-const envAllowedOrigins = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
 const allowedOrigins = Array.from(
-  new Set(envAllowedOrigins.length ? envAllowedOrigins : DEFAULT_ALLOWED_ORIGINS)
+  new Set(
+    (process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  )
 );
 
 const allowAllOrigins = allowedOrigins.includes("*");
 
+const LIMITS = {
+  maxConnectionsPerIp: Number(process.env.MAX_CONNECTIONS_PER_IP || 12),
+  maxDomainsPerSocket: Number(process.env.MAX_DOMAINS_PER_SOCKET || 75),
+  registerPresencePerMinute: Number(process.env.REGISTER_PRESENCE_PER_MINUTE || 8),
+  startCallPerMinute: Number(process.env.START_CALL_PER_MINUTE || 10),
+  messagePerMinute: Number(process.env.MESSAGE_PER_MINUTE || 80),
+  webrtcSignalPerMinute: Number(process.env.WEBRTC_SIGNAL_PER_MINUTE || 220),
+  videoTogglePerMinute: Number(process.env.VIDEO_TOGGLE_PER_MINUTE || 30),
+  pendingCallTtlMs: Number(process.env.PENDING_CALL_TTL_MS || 120000),
+  maxTextLength: Number(process.env.MAX_TEXT_LENGTH || 2000),
+};
+
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "256kb" }));
+
+function getOrigin(req) {
+  return req.headers.origin || "";
+}
+
+function isAllowedOrigin(origin) {
+  return !origin || allowAllOrigins || allowedOrigins.includes(origin);
+}
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin || allowAllOrigins || allowedOrigins.includes(origin)) {
-        return cb(null, true);
-      }
-
+      if (isAllowedOrigin(origin)) return cb(null, true);
       console.warn("[CORS BLOCKED]", origin);
       return cb(null, false);
     },
@@ -58,13 +76,38 @@ const io = new Server(server, {
   transports: ["websocket", "polling"],
 });
 
-const socketProfiles = new Map(); // socket.id -> { wallet, activeDomain, domains:Set(canonical) }
-const domainSockets = new Map(); // canonical domain -> Set(socket.id)
-const calls = new Map(); // callId -> call object
+const socketProfiles = new Map(); // socket.id -> profile
+const domainSockets = new Map();  // canonical domain -> Set(socket.id)
+const calls = new Map();          // callId -> call
+const ipSockets = new Map();      // ip -> Set(socket.id)
+const buckets = new Map();        // key -> { count, resetAt }
+
+function ipForSocket(socket) {
+  const xfwd = socket.handshake.headers["x-forwarded-for"];
+  if (typeof xfwd === "string" && xfwd.trim()) return xfwd.split(",")[0].trim();
+  return socket.handshake.address || "unknown";
+}
+
+function rateLimit(key, max, windowMs = 60000) {
+  const now = Date.now();
+  const existing = buckets.get(key);
+
+  if (!existing || now >= existing.resetAt) {
+    buckets.set(key, { count: 1, resetAt: now + windowMs });
+    return { ok: true, remaining: Math.max(0, max - 1) };
+  }
+
+  existing.count += 1;
+
+  if (existing.count > max) {
+    return { ok: false, retryAfterMs: existing.resetAt - now };
+  }
+
+  return { ok: true, remaining: Math.max(0, max - existing.count) };
+}
 
 function cleanDomainInput(domain) {
   let value = String(domain || "").trim();
-
   value = value.replace(/^https?:\/\//i, "");
   value = value.replace(/^fns:\/\//i, "");
   value = value.replace(/^@/, "");
@@ -72,18 +115,14 @@ function cleanDomainInput(domain) {
   value = value.replace(/\s+/g, "");
   value = value.replace(/^\.+/, "");
   value = value.replace(/\.+$/, "");
-  value = value.toLowerCase();
-
-  return value;
+  return value.toLowerCase();
 }
 
 function canonicalDomain(domain) {
   const cleaned = cleanDomainInput(domain);
   if (!cleaned) return "";
-
   try {
-    const ascii = domainToASCII(cleaned);
-    return ascii || cleaned;
+    return domainToASCII(cleaned) || cleaned;
   } catch {
     return cleaned;
   }
@@ -92,7 +131,6 @@ function canonicalDomain(domain) {
 function displayDomain(domain) {
   const cleaned = cleanDomainInput(domain);
   if (!cleaned) return "";
-
   try {
     return domainToUnicode(cleaned) || cleaned;
   } catch {
@@ -101,19 +139,13 @@ function displayDomain(domain) {
 }
 
 function makeRoom(a, b) {
-  const left = canonicalDomain(a);
-  const right = canonicalDomain(b);
-  return [left, right].sort().join("__");
+  return [canonicalDomain(a), canonicalDomain(b)].sort().join("__");
 }
 
 function addDomainSocket(domain, socketId) {
   const key = canonicalDomain(domain);
   if (!key) return;
-
-  if (!domainSockets.has(key)) {
-    domainSockets.set(key, new Set());
-  }
-
+  if (!domainSockets.has(key)) domainSockets.set(key, new Set());
   domainSockets.get(key).add(socketId);
 }
 
@@ -122,40 +154,47 @@ function removeSocket(socketId) {
 
   if (profile) {
     for (const domain of profile.domains || []) {
-      const key = canonicalDomain(domain);
-      const set = domainSockets.get(key);
-
+      const set = domainSockets.get(domain);
       if (set) {
         set.delete(socketId);
-
-        if (!set.size) {
-          domainSockets.delete(key);
-        }
+        if (!set.size) domainSockets.delete(domain);
       }
     }
   }
 
   socketProfiles.delete(socketId);
+
+  for (const [ip, set] of ipSockets.entries()) {
+    set.delete(socketId);
+    if (!set.size) ipSockets.delete(ip);
+  }
 }
 
 function onlineSocketsFor(domain) {
   const key = canonicalDomain(domain);
   const set = domainSockets.get(key);
-
   if (!set) return [];
-
   return Array.from(set).filter((id) => io.sockets.sockets.has(id));
 }
 
 function socketOwnsDomain(socket, domain) {
   const profile = socketProfiles.get(socket.id);
   const key = canonicalDomain(domain);
-
   return !!profile && !!profile.domains && profile.domains.has(key);
 }
 
+function emitRateLimit(socket, area, result) {
+  socket.emit("rate-limited", {
+    area,
+    message: `Too many ${area} requests. Try again shortly.`,
+    retryAfterMs: result.retryAfterMs || 0,
+  });
+}
+
 function registerPresence(socket, payload = {}) {
-  removeSocket(socket.id);
+  const ip = ipForSocket(socket);
+  const rl = rateLimit(`presence:${socket.id}`, LIMITS.registerPresencePerMinute);
+  if (!rl.ok) return emitRateLimit(socket, "presence", rl);
 
   const rawDomains = Array.from(
     new Set(
@@ -166,56 +205,62 @@ function registerPresence(socket, payload = {}) {
     )
   );
 
-  const activeRaw = cleanDomainInput(payload.activeDomain || rawDomains[0] || "");
-  const activeCanonical = canonicalDomain(activeRaw);
-  const wallet = String(payload.wallet || "");
+  if (!rawDomains.length && payload.activeDomain) {
+    rawDomains.push(cleanDomainInput(payload.activeDomain));
+  }
 
-  const canonicalDomains = Array.from(
-    new Set(
-      rawDomains
-        .map(canonicalDomain)
-        .filter(Boolean)
-    )
-  );
+  if (!rawDomains.length) {
+    socket.emit("presence-error", { message: "No domains supplied for presence registration." });
+    return;
+  }
+
+  if (rawDomains.length > LIMITS.maxDomainsPerSocket) {
+    socket.emit("presence-error", {
+      message: `Too many identities for one session. Limit is ${LIMITS.maxDomainsPerSocket}.`,
+    });
+    return;
+  }
+
+  removeSocket(socket.id);
+
+  const wallet = String(payload.wallet || "").trim();
+  const activeCanonical = canonicalDomain(payload.activeDomain || rawDomains[0]);
+  const canonicalDomains = Array.from(new Set(rawDomains.map(canonicalDomain).filter(Boolean)));
 
   if (activeCanonical && !canonicalDomains.includes(activeCanonical)) {
     canonicalDomains.unshift(activeCanonical);
   }
 
   socketProfiles.set(socket.id, {
+    ip,
     wallet,
     activeDomain: activeCanonical,
     domains: new Set(canonicalDomains),
-    displayDomains: rawDomains,
+    createdAt: Date.now(),
   });
+
+  if (!ipSockets.has(ip)) ipSockets.set(ip, new Set());
+  ipSockets.get(ip).add(socket.id);
 
   for (const domain of canonicalDomains) {
     addDomainSocket(domain, socket.id);
     socket.join(`identity:${domain}`);
   }
 
-  if (activeCanonical) {
-    socket.join(`identity:${activeCanonical}`);
-  }
-
   socket.emit("presence-registered", {
     ok: true,
     wallet,
-    activeDomain: displayDomain(activeRaw || activeCanonical),
+    activeDomain: displayDomain(activeCanonical),
     activeCanonical,
-    domains: rawDomains.map(displayDomain),
-    canonicalDomains,
-  });
-
-  console.log("[presence]", {
-    socket: socket.id,
-    wallet: wallet ? `${wallet.slice(0, 6)}...${wallet.slice(-4)}` : "",
-    activeCanonical,
+    domains: canonicalDomains.map(displayDomain),
     canonicalDomains,
   });
 }
 
 function startCall(socket, payload = {}) {
+  const rl = rateLimit(`start-call:${socket.id}`, LIMITS.startCallPerMinute);
+  if (!rl.ok) return emitRateLimit(socket, "calls", rl);
+
   const fromDomainRaw = String(payload.fromDomain || payload.from || "");
   const toDomainRaw = String(payload.toDomain || payload.to || "");
 
@@ -223,22 +268,18 @@ function startCall(socket, payload = {}) {
   const toDomain = canonicalDomain(toDomainRaw);
 
   if (!fromDomain || !toDomain) {
-    socket.emit("call-error", {
-      message: "Missing fromDomain or toDomain.",
-    });
+    socket.emit("call-error", { message: "Missing fromDomain or toDomain." });
     return;
   }
 
   if (fromDomain === toDomain) {
-    socket.emit("call-error", {
-      message: "You cannot call the same domain identity.",
-    });
+    socket.emit("call-error", { message: "You cannot call the same identity." });
     return;
   }
 
   if (!socketOwnsDomain(socket, fromDomain)) {
     socket.emit("call-error", {
-      message: "Caller domain is not registered to this online wallet session.",
+      message: "Caller identity is not registered to this online wallet session.",
     });
     return;
   }
@@ -292,7 +333,6 @@ function startCall(socket, payload = {}) {
       at: Date.now(),
     });
 
-    // Compatibility alias for older/sandbox clients.
     io.to(targetSocketId).emit("call-invite", {
       callId,
       fromDomain: call.fromDomain,
@@ -304,31 +344,17 @@ function startCall(socket, payload = {}) {
       at: Date.now(),
     });
   }
-
-  console.log("[start-call]", {
-    callId,
-    room,
-    from: call.fromCanonical,
-    to: call.toCanonical,
-    targets: targets.length,
-  });
 }
 
 function acceptCall(socket, payload = {}) {
   const call = calls.get(payload.callId);
 
   if (!call) {
-    socket.emit("call-error", {
-      message: "Call no longer exists.",
-    });
+    socket.emit("call-error", { message: "Call no longer exists." });
     return;
   }
 
-  const calleeOwnsTarget =
-    socketOwnsDomain(socket, call.toCanonical) ||
-    socketOwnsDomain(socket, call.toDomain);
-
-  if (!calleeOwnsTarget) {
+  if (!socketOwnsDomain(socket, call.toCanonical)) {
     socket.emit("call-error", {
       message: "This wallet session is not registered as the called identity.",
     });
@@ -338,9 +364,7 @@ function acceptCall(socket, payload = {}) {
   socket.join(call.room);
 
   const caller = io.sockets.sockets.get(call.fromSocketId);
-  if (caller) {
-    caller.join(call.room);
-  }
+  if (caller) caller.join(call.room);
 
   io.to(call.fromSocketId).emit("call-started", {
     callId: call.callId,
@@ -369,13 +393,6 @@ function acceptCall(socket, payload = {}) {
   });
 
   calls.delete(call.callId);
-
-  console.log("[accept-call]", {
-    callId: call.callId,
-    room: call.room,
-    caller: call.fromCanonical,
-    callee: call.toCanonical,
-  });
 }
 
 function rejectCall(socket, payload = {}) {
@@ -389,17 +406,15 @@ function rejectCall(socket, payload = {}) {
   });
 
   calls.delete(call.callId);
-
-  console.log("[reject-call]", {
-    callId: call.callId,
-    by: socket.id,
-  });
 }
 
 function relayDomainMessage(socket, payload = {}) {
+  const rl = rateLimit(`message:${socket.id}`, LIMITS.messagePerMinute);
+  if (!rl.ok) return emitRateLimit(socket, "messages", rl);
+
   const fromDomain = String(payload.fromDomain || payload.from || "");
   const toDomain = String(payload.toDomain || payload.to || "");
-  const text = String(payload.text || payload.message || "").slice(0, 4000);
+  const text = String(payload.text || payload.message || "").slice(0, LIMITS.maxTextLength);
   const room = String(payload.room || makeRoom(fromDomain, toDomain));
 
   if (!room || !text) return;
@@ -414,7 +429,6 @@ function relayDomainMessage(socket, payload = {}) {
     at: Date.now(),
   });
 
-  // Compatibility alias for older/sandbox clients.
   socket.to(room).emit("chat-message", {
     fromDomain: displayDomain(fromDomain),
     toDomain: displayDomain(toDomain),
@@ -452,7 +466,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "aigen-domain-chat-signal-server",
-    version: "20260511-sandbox-compatible",
+    version: "20260512-abuse-protected",
   });
 });
 
@@ -460,11 +474,12 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aigen-domain-chat-signal-server",
-    version: "20260511-sandbox-compatible",
+    version: "20260512-abuse-protected",
     onlineSockets: socketProfiles.size,
     onlineDomains: domainSockets.size,
     pendingCalls: calls.size,
     allowedOrigins: allowAllOrigins ? ["*"] : allowedOrigins,
+    limits: LIMITS,
   });
 });
 
@@ -481,42 +496,37 @@ app.get("/presence/:domain", (req, res) => {
   });
 });
 
-app.get("/debug/presence", (_req, res) => {
-  const domains = [];
+io.use((socket, next) => {
+  const origin = socket.handshake.headers.origin || "";
 
-  for (const [domain, sockets] of domainSockets.entries()) {
-    domains.push({
-      domain: displayDomain(domain),
-      canonical: domain,
-      sockets: Array.from(sockets).filter((id) => io.sockets.sockets.has(id)).length,
-    });
+  if (!isAllowedOrigin(origin)) {
+    return next(new Error("origin_not_allowed"));
   }
 
-  res.json({
-    ok: true,
-    onlineSockets: socketProfiles.size,
-    onlineDomains: domains.length,
-    domains,
-  });
+  const ip = ipForSocket(socket);
+  const current = ipSockets.get(ip);
+
+  if (current && current.size >= LIMITS.maxConnectionsPerIp) {
+    return next(new Error("too_many_connections"));
+  }
+
+  return next();
 });
 
 io.on("connection", (socket) => {
-  console.log("[socket connected]", {
-    id: socket.id,
-    origin: socket.handshake.headers.origin,
-  });
+  const ip = ipForSocket(socket);
+
+  if (!ipSockets.has(ip)) ipSockets.set(ip, new Set());
+  ipSockets.get(ip).add(socket.id);
 
   socket.emit("signal-ready", {
     ok: true,
     socketId: socket.id,
-    version: "20260511-sandbox-compatible",
+    version: "20260512-abuse-protected",
   });
 
-  socket.on("register-presence", (payload = {}) => {
-    registerPresence(socket, payload);
-  });
+  socket.on("register-presence", (payload = {}) => registerPresence(socket, payload));
 
-  // Sandbox / compatibility alias.
   socket.on("join-identity", (payload = {}) => {
     const identity = payload.identity || payload.activeDomain || payload.domain;
     registerPresence(socket, {
@@ -526,11 +536,8 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("start-call", (payload = {}) => {
-    startCall(socket, payload);
-  });
+  socket.on("start-call", (payload = {}) => startCall(socket, payload));
 
-  // Sandbox / compatibility alias.
   socket.on("call-invite", (payload = {}) => {
     startCall(socket, {
       fromDomain: payload.fromDomain || payload.from,
@@ -539,28 +546,16 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("accept-call", (payload = {}) => {
-    acceptCall(socket, payload);
-  });
-
-  socket.on("reject-call", (payload = {}) => {
-    rejectCall(socket, payload);
-  });
-
-  socket.on("domain-message", (payload = {}) => {
-    relayDomainMessage(socket, payload);
-  });
-
-  // Sandbox / compatibility alias.
-  socket.on("chat-message", (payload = {}) => {
-    relayDomainMessage(socket, payload);
-  });
-
-  socket.on("end-chat", (payload = {}) => {
-    endChat(socket, payload);
-  });
+  socket.on("accept-call", (payload = {}) => acceptCall(socket, payload));
+  socket.on("reject-call", (payload = {}) => rejectCall(socket, payload));
+  socket.on("domain-message", (payload = {}) => relayDomainMessage(socket, payload));
+  socket.on("chat-message", (payload = {}) => relayDomainMessage(socket, payload));
+  socket.on("end-chat", (payload = {}) => endChat(socket, payload));
 
   socket.on("webrtc-signal", (payload = {}) => {
+    const rl = rateLimit(`webrtc:${socket.id}`, LIMITS.webrtcSignalPerMinute);
+    if (!rl.ok) return emitRateLimit(socket, "webrtc", rl);
+
     const room = String(payload.room || "");
     const data = payload.data;
 
@@ -575,39 +570,30 @@ io.on("connection", (socket) => {
   });
 
   socket.on("video-toggle", (payload = {}) => {
+    const rl = rateLimit(`video-toggle:${socket.id}`, LIMITS.videoTogglePerMinute);
+    if (!rl.ok) return emitRateLimit(socket, "video-toggle", rl);
+
     const room = String(payload.room || "");
-
     if (!room) return;
-
-    const fromDomain = String(payload.fromDomain || "");
-    const enabled = !!payload.enabled;
 
     socket.to(room).emit("video-toggle", {
       room,
-      fromDomain: displayDomain(fromDomain),
-      fromCanonical: canonicalDomain(fromDomain),
-      enabled,
+      fromDomain: displayDomain(payload.fromDomain || ""),
+      fromCanonical: canonicalDomain(payload.fromDomain || ""),
+      enabled: !!payload.enabled,
       at: Date.now(),
     });
   });
 
-  socket.on("disconnect", (reason) => {
-    console.log("[socket disconnected]", {
-      id: socket.id,
-      reason,
-    });
-
-    removeSocket(socket.id);
-  });
+  socket.on("disconnect", () => removeSocket(socket.id));
 });
 
 setInterval(() => {
   const now = Date.now();
 
   for (const [callId, call] of calls.entries()) {
-    if (now - call.createdAt > 2 * 60 * 1000) {
+    if (now - call.createdAt > LIMITS.pendingCallTtlMs) {
       calls.delete(callId);
-
       io.to(call.fromSocketId).emit("call-error", {
         message: "Call expired with no answer.",
         callId,
@@ -615,7 +601,11 @@ setInterval(() => {
       });
     }
   }
-}, 30 * 1000);
+
+  for (const [key, bucket] of buckets.entries()) {
+    if (now >= bucket.resetAt + 60000) buckets.delete(key);
+  }
+}, 30000);
 
 server.listen(PORT, () => {
   console.log(`AIGEN signal server listening on :${PORT}`);
