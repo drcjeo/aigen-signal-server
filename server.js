@@ -74,6 +74,11 @@ function identityKeysFromPayload(payload = {}) {
     normalizeIdentity(payload.name),
     normalizeIdentity(payload.fromDomain),
     normalizeIdentity(payload.toDomain),
+    normalizeIdentity(payload.targetIdentity),
+    normalizeIdentity(payload.calleeIdentity),
+    normalizeIdentity(payload.to),
+    normalizeIdentity(payload.target),
+    normalizeIdentity(payload.callee),
     normalizeIdentity(payload.normalizedToIdentity),
     normalizeIdentity(payload.normalizedFromIdentity),
     normalizeIdentity(payload.toIdentity?.normalizedIdentity),
@@ -104,6 +109,8 @@ function walletKeysFromPayload(payload = {}) {
     normalizeWallet(payload.ownerWallet),
     normalizeWallet(payload.resolvedWallet),
     normalizeWallet(payload.wallet),
+    normalizeWallet(payload.targetWallet),
+    normalizeWallet(payload.callerWallet),
     normalizeWallet(payload.toIdentity?.ownerWallet),
     normalizeWallet(payload.toIdentity?.resolvedWallet),
     normalizeWallet(payload.toIdentity?.connectedWallet),
@@ -157,7 +164,7 @@ function resolvePresenceTarget(payload = {}) {
 
   for (const key of walletKeys) {
     const sockets = onlineSocketsFromMap(presenceByWallet, key);
-    if (sockets.length) return { sockets, matchedBy: "ownerWallet", targetIdentity: Array.from(identityKeys)[0] || "", targetWallet: key };
+    if (sockets.length) return { sockets, matchedBy: "wallet", targetIdentity: Array.from(identityKeys)[0] || "", targetWallet: key };
   }
 
   return {
@@ -205,7 +212,8 @@ app.get("/presence/:domain", (req, res) => {
     canonical: result.targetIdentity || normalizeIdentity(domain),
     online: result.sockets.length > 0,
     presenceStatus: result.sockets.length > 0 ? "online" : "offline",
-    matchedBy: result.matchedBy
+    matchedBy: result.matchedBy,
+    matchedKey: result.matchedBy === "wallet" ? result.targetWallet : (result.matchedBy === "identity" ? result.targetIdentity : "")
   });
 });
 
@@ -216,6 +224,7 @@ function emitPresenceResult(socket, payload = {}, eventName = "presence-result")
     online: result.sockets.length > 0,
     presenceStatus: result.sockets.length > 0 ? "online" : "offline",
     matchedBy: result.matchedBy,
+    matchedKey: result.matchedBy === "wallet" ? result.targetWallet : (result.matchedBy === "identity" ? result.targetIdentity : ""),
     targetIdentity: result.targetIdentity,
     targetWallet: result.targetWallet,
     sockets: result.sockets.length
@@ -282,8 +291,12 @@ io.on("connection", (socket) => {
   socket.on("start-call", (payload = {}) => {
     const fromDomain = String(payload.fromDomain || "");
     const toDomain = String(payload.toDomain || "");
-    const toIdentity = payload.toIdentity || {};
-    const fromIdentity = payload.fromIdentity || {};
+    const toIdentity = (payload.toIdentity && typeof payload.toIdentity === "object")
+      ? payload.toIdentity
+      : ((payload.targetIdentityPacket && typeof payload.targetIdentityPacket === "object") ? payload.targetIdentityPacket : {});
+    const fromIdentity = (payload.fromIdentity && typeof payload.fromIdentity === "object")
+      ? payload.fromIdentity
+      : ((payload.callerIdentityPacket && typeof payload.callerIdentityPacket === "object") ? payload.callerIdentityPacket : {});
 
     if (!fromDomain || !toDomain) {
       socket.emit("call-error", { message: "Missing fromDomain or toDomain." });
@@ -313,8 +326,13 @@ io.on("connection", (socket) => {
       domain: toDomain,
       identity: toDomain,
       normalizedIdentity: payload.normalizedToIdentity || toIdentity.normalizedIdentity,
+      targetIdentity: payload.targetIdentity,
+      calleeIdentity: payload.calleeIdentity,
+      to: payload.to,
+      target: payload.target,
+      callee: payload.callee,
       ownerWallet: toIdentity.ownerWallet || payload.ownerWallet,
-      resolvedWallet: toIdentity.resolvedWallet || payload.resolvedWallet,
+      resolvedWallet: toIdentity.resolvedWallet || payload.targetIdentityPacket?.resolvedWallet || payload.resolvedWallet || payload.targetWallet,
       connectedWallet: payload.targetConnectedWallet || "",
       wallet: payload.wallet
     });
@@ -385,12 +403,19 @@ io.on("connection", (socket) => {
     if (!fromDomain || !toDomain || !text) return;
 
     const target = resolvePresenceTarget({
-      ...(payload.toIdentity || {}),
+      ...((payload.toIdentity && typeof payload.toIdentity === "object")
+        ? payload.toIdentity
+        : ((payload.targetIdentityPacket && typeof payload.targetIdentityPacket === "object") ? payload.targetIdentityPacket : {})),
       domain: toDomain,
       identity: toDomain,
       normalizedIdentity: payload.normalizedToIdentity || payload.toIdentity?.normalizedIdentity,
+      targetIdentity: payload.targetIdentity,
+      calleeIdentity: payload.calleeIdentity,
+      to: payload.to,
+      target: payload.target,
+      callee: payload.callee,
       ownerWallet: payload.toIdentity?.ownerWallet || payload.ownerWallet,
-      resolvedWallet: payload.toIdentity?.resolvedWallet || payload.resolvedWallet,
+      resolvedWallet: payload.toIdentity?.resolvedWallet || payload.targetIdentityPacket?.resolvedWallet || payload.resolvedWallet || payload.targetWallet,
       connectedWallet: payload.targetConnectedWallet || "",
       wallet: payload.wallet
     });
