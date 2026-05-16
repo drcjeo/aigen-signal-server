@@ -85,6 +85,10 @@ function identityKeysFromPayload(payload = {}) {
   ].filter(Boolean));
 
   for (const domain of payload.domains || []) keys.add(normalizeIdentity(domain));
+  for (const domain of payload.receivingIdentities || []) keys.add(normalizeIdentity(domain));
+  for (const domain of payload.reachableIdentities || []) {
+    if (!normalizeWallet(domain)) keys.add(normalizeIdentity(domain));
+  }
   for (const identity of payload.identities || []) {
     keys.add(normalizeIdentity(identity?.normalizedIdentity));
     keys.add(normalizeIdentity(identity?.identity));
@@ -109,6 +113,7 @@ function walletKeysFromPayload(payload = {}) {
   ].filter(Boolean));
 
   for (const wallet of payload.resolvedWallets || []) keys.add(normalizeWallet(wallet));
+  for (const wallet of payload.reachableIdentities || []) keys.add(normalizeWallet(wallet));
   for (const wallet of payload.toIdentity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
   for (const wallet of payload.fromIdentity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
   for (const identity of payload.identities || []) {
