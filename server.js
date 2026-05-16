@@ -3,620 +3,433 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 import { Server } from "socket.io";
-import { domainToASCII, domainToUnicode } from "node:url";
 
 const PORT = Number(process.env.PORT || 8787);
-
-const DEFAULT_ALLOWED_ORIGINS = [
-  "https://chat.aigen.domains",
-  "https://sandbox.aigen.domains",
-  "https://agents.aigen.domains",
-  "https://aigen.domains",
-  "https://api.namespace.domains",
-  "https://namespace.domains",
-  "https://www.namespace.domains",
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "http://127.0.0.1:3000",
-  "http://127.0.0.1:5173",
-];
-
-const ENV_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-/*
-  Important:
-  Railway env origins are MERGED with defaults, not used as a replacement.
-  This prevents sandbox.aigen.domains from being accidentally blocked when
-  ALLOWED_ORIGINS is incomplete in Railway Variables.
-*/
-const allowedOrigins = Array.from(
-  new Set([...DEFAULT_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS])
-);
-
-const allowAllOrigins = allowedOrigins.includes("*");
-
-const LIMITS = {
-  maxConnectionsPerIp: Number(process.env.MAX_CONNECTIONS_PER_IP || 12),
-  maxDomainsPerSocket: Number(process.env.MAX_DOMAINS_PER_SOCKET || 75),
-  registerPresencePerMinute: Number(process.env.REGISTER_PRESENCE_PER_MINUTE || 8),
-  startCallPerMinute: Number(process.env.START_CALL_PER_MINUTE || 10),
-  messagePerMinute: Number(process.env.MESSAGE_PER_MINUTE || 80),
-  webrtcSignalPerMinute: Number(process.env.WEBRTC_SIGNAL_PER_MINUTE || 220),
-  videoTogglePerMinute: Number(process.env.VIDEO_TOGGLE_PER_MINUTE || 30),
-  pendingCallTtlMs: Number(process.env.PENDING_CALL_TTL_MS || 120000),
-  maxTextLength: Number(process.env.MAX_TEXT_LENGTH || 2000),
-};
-
 const app = express();
-app.set("trust proxy", 1);
-app.use(express.json({ limit: "256kb" }));
-
-function isAllowedOrigin(origin) {
-  return !origin || allowAllOrigins || allowedOrigins.includes(origin);
-}
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (isAllowedOrigin(origin)) return cb(null, true);
-      console.warn("[CORS BLOCKED]", origin);
-      return cb(null, false);
-    },
-    credentials: true,
-  })
-);
+app.use(express.json());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  credentials: true
+}));
 
 const server = http.createServer(app);
-
 const io = new Server(server, {
   cors: {
-    origin: allowAllOrigins ? "*" : allowedOrigins,
-    credentials: true,
-    methods: ["GET", "POST"],
-  },
-  transports: ["websocket", "polling"],
+    origin: allowedOrigins.includes("*") ? "*" : allowedOrigins,
+    credentials: true
+  }
 });
 
-const socketProfiles = new Map(); // socket.id -> profile
-const domainSockets = new Map();  // canonical domain -> Set(socket.id)
+const socketProfiles = new Map(); // socket.id -> { wallet, activeDomain, identityKeys:Set, walletKeys:Set }
+const presenceByIdentity = new Map(); // normalized identity -> Set(socket.id)
+const presenceByWallet = new Map();   // normalized wallet -> Set(socket.id)
 const calls = new Map();          // callId -> call
-const ipSockets = new Map();      // ip -> Set(socket.id)
-const buckets = new Map();        // key -> { count, resetAt }
 
-function ipForSocket(socket) {
-  const xfwd = socket.handshake.headers["x-forwarded-for"];
-  if (typeof xfwd === "string" && xfwd.trim()) return xfwd.split(",")[0].trim();
-  return socket.handshake.address || "unknown";
+function normalizeIdentity(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^@/, "")
+    .toLowerCase();
 }
 
-function rateLimit(key, max, windowMs = 60000) {
-  const now = Date.now();
-  const existing = buckets.get(key);
-
-  if (!existing || now >= existing.resetAt) {
-    buckets.set(key, { count: 1, resetAt: now + windowMs });
-    return { ok: true, remaining: Math.max(0, max - 1) };
-  }
-
-  existing.count += 1;
-
-  if (existing.count > max) {
-    return { ok: false, retryAfterMs: existing.resetAt - now };
-  }
-
-  return { ok: true, remaining: Math.max(0, max - existing.count) };
+function normalizeWallet(value) {
+  const s = String(value || "").trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(s) ? s : "";
 }
 
-function cleanDomainInput(domain) {
-  let value = String(domain || "").trim();
-  value = value.replace(/^https?:\/\//i, "");
-  value = value.replace(/^fns:\/\//i, "");
-  value = value.replace(/^@/, "");
-  value = value.split(/[/?#]/)[0] || value;
-  value = value.replace(/\s+/g, "");
-  value = value.replace(/^\.+/, "");
-  value = value.replace(/\.+$/, "");
-  return value.toLowerCase();
+function norm(domain) {
+  return normalizeIdentity(domain);
 }
 
-function canonicalDomain(domain) {
-  const cleaned = cleanDomainInput(domain);
-  if (!cleaned) return "";
-  try {
-    return domainToASCII(cleaned) || cleaned;
-  } catch {
-    return cleaned;
-  }
-}
-
-function displayDomain(domain) {
-  const cleaned = cleanDomainInput(domain);
-  if (!cleaned) return "";
-  try {
-    return domainToUnicode(cleaned) || cleaned;
-  } catch {
-    return cleaned;
-  }
-}
-
-function makeRoom(a, b) {
-  return [canonicalDomain(a), canonicalDomain(b)].sort().join("__");
-}
-
-function addDomainSocket(domain, socketId) {
-  const key = canonicalDomain(domain);
+function addPresence(map, key, socketId) {
   if (!key) return;
-  if (!domainSockets.has(key)) domainSockets.set(key, new Set());
-  domainSockets.get(key).add(socketId);
+  if (!map.has(key)) map.set(key, new Set());
+  map.get(key).add(socketId);
+}
+
+function removePresence(map, key, socketId) {
+  const set = map.get(key);
+  if (!set) return;
+  set.delete(socketId);
+  if (!set.size) map.delete(key);
+}
+
+function identityKeysFromPayload(payload = {}) {
+  const keys = new Set([
+    normalizeIdentity(payload.normalizedIdentity),
+    normalizeIdentity(payload.selectedIdentity),
+    normalizeIdentity(payload.identity),
+    normalizeIdentity(payload.domain),
+    normalizeIdentity(payload.selectedDomain),
+    normalizeIdentity(payload.selectedFNSDomain),
+    normalizeIdentity(payload.activeDomain),
+    normalizeIdentity(payload.name),
+    normalizeIdentity(payload.fromDomain),
+    normalizeIdentity(payload.toDomain),
+    normalizeIdentity(payload.normalizedToIdentity),
+    normalizeIdentity(payload.normalizedFromIdentity),
+    normalizeIdentity(payload.toIdentity?.normalizedIdentity),
+    normalizeIdentity(payload.toIdentity?.identity),
+    normalizeIdentity(payload.toIdentity?.name),
+    normalizeIdentity(payload.fromIdentity?.normalizedIdentity),
+    normalizeIdentity(payload.fromIdentity?.identity),
+    normalizeIdentity(payload.fromIdentity?.name)
+  ].filter(Boolean));
+
+  for (const domain of payload.domains || []) keys.add(normalizeIdentity(domain));
+  for (const identity of payload.identities || []) {
+    keys.add(normalizeIdentity(identity?.normalizedIdentity));
+    keys.add(normalizeIdentity(identity?.identity));
+    keys.add(normalizeIdentity(identity?.name));
+  }
+
+  return keys;
+}
+
+function walletKeysFromPayload(payload = {}) {
+  const keys = new Set([
+    normalizeWallet(payload.connectedWallet),
+    normalizeWallet(payload.ownerWallet),
+    normalizeWallet(payload.resolvedWallet),
+    normalizeWallet(payload.wallet),
+    normalizeWallet(payload.toIdentity?.ownerWallet),
+    normalizeWallet(payload.toIdentity?.resolvedWallet),
+    normalizeWallet(payload.toIdentity?.connectedWallet),
+    normalizeWallet(payload.fromIdentity?.ownerWallet),
+    normalizeWallet(payload.fromIdentity?.resolvedWallet),
+    normalizeWallet(payload.fromIdentity?.connectedWallet)
+  ].filter(Boolean));
+
+  for (const wallet of payload.resolvedWallets || []) keys.add(normalizeWallet(wallet));
+  for (const wallet of payload.toIdentity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
+  for (const wallet of payload.fromIdentity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
+  for (const identity of payload.identities || []) {
+    keys.add(normalizeWallet(identity?.ownerWallet));
+    keys.add(normalizeWallet(identity?.resolvedWallet));
+    keys.add(normalizeWallet(identity?.connectedWallet));
+    for (const wallet of identity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
+  }
+
+  keys.delete("");
+  return keys;
 }
 
 function removeSocket(socketId) {
   const profile = socketProfiles.get(socketId);
-
   if (profile) {
-    for (const domain of profile.domains || []) {
-      const set = domainSockets.get(domain);
-      if (set) {
-        set.delete(socketId);
-        if (!set.size) domainSockets.delete(domain);
-      }
-    }
+    for (const key of profile.identityKeys || []) removePresence(presenceByIdentity, key, socketId);
+    for (const key of profile.walletKeys || []) removePresence(presenceByWallet, key, socketId);
   }
-
   socketProfiles.delete(socketId);
-
-  for (const [ip, set] of ipSockets.entries()) {
-    set.delete(socketId);
-    if (!set.size) ipSockets.delete(ip);
-  }
 }
 
-function onlineSocketsFor(domain) {
-  const key = canonicalDomain(domain);
-  const set = domainSockets.get(key);
+function onlineSocketsFromMap(map, key) {
+  const set = map.get(key);
   if (!set) return [];
   return Array.from(set).filter((id) => io.sockets.sockets.has(id));
 }
 
-function socketOwnsDomain(socket, domain) {
-  const profile = socketProfiles.get(socket.id);
-  const key = canonicalDomain(domain);
-  return !!profile && !!profile.domains && profile.domains.has(key);
+function onlineSocketsFor(domain) {
+  return onlineSocketsFromMap(presenceByIdentity, norm(domain));
 }
 
-function emitRateLimit(socket, area, result) {
-  socket.emit("rate-limited", {
-    area,
-    message: `Too many ${area} requests. Try again shortly.`,
-    retryAfterMs: result.retryAfterMs || 0,
-  });
-}
+function resolvePresenceTarget(payload = {}) {
+  const identityKeys = identityKeysFromPayload(payload);
+  const walletKeys = walletKeysFromPayload(payload);
 
-function registerPresence(socket, payload = {}) {
-  const rl = rateLimit(`presence:${socket.id}`, LIMITS.registerPresencePerMinute);
-  if (!rl.ok) return emitRateLimit(socket, "presence", rl);
-
-  const rawDomains = Array.from(
-    new Set(
-      (payload.domains || [])
-        .map(String)
-        .map(cleanDomainInput)
-        .filter(Boolean)
-    )
-  );
-
-  if (!rawDomains.length && payload.activeDomain) {
-    rawDomains.push(cleanDomainInput(payload.activeDomain));
+  for (const key of identityKeys) {
+    const sockets = onlineSocketsFromMap(presenceByIdentity, key);
+    if (sockets.length) return { sockets, matchedBy: "identity", targetIdentity: key, targetWallet: "" };
   }
 
-  if (!rawDomains.length) {
-    socket.emit("presence-error", { message: "No domains supplied for presence registration." });
-    return;
+  for (const key of walletKeys) {
+    const sockets = onlineSocketsFromMap(presenceByWallet, key);
+    if (sockets.length) return { sockets, matchedBy: "ownerWallet", targetIdentity: Array.from(identityKeys)[0] || "", targetWallet: key };
   }
 
-  if (rawDomains.length > LIMITS.maxDomainsPerSocket) {
-    socket.emit("presence-error", {
-      message: `Too many identities for one session. Limit is ${LIMITS.maxDomainsPerSocket}.`,
-    });
-    return;
-  }
-
-  removeSocket(socket.id);
-
-  const ip = ipForSocket(socket);
-  const wallet = String(payload.wallet || "").trim();
-  const activeCanonical = canonicalDomain(payload.activeDomain || rawDomains[0]);
-  const canonicalDomains = Array.from(new Set(rawDomains.map(canonicalDomain).filter(Boolean)));
-
-  if (activeCanonical && !canonicalDomains.includes(activeCanonical)) {
-    canonicalDomains.unshift(activeCanonical);
-  }
-
-  socketProfiles.set(socket.id, {
-    ip,
-    wallet,
-    activeDomain: activeCanonical,
-    domains: new Set(canonicalDomains),
-    createdAt: Date.now(),
-  });
-
-  if (!ipSockets.has(ip)) ipSockets.set(ip, new Set());
-  ipSockets.get(ip).add(socket.id);
-
-  for (const domain of canonicalDomains) {
-    addDomainSocket(domain, socket.id);
-    socket.join(`identity:${domain}`);
-  }
-
-  socket.emit("presence-registered", {
-    ok: true,
-    wallet,
-    activeDomain: displayDomain(activeCanonical),
-    activeCanonical,
-    domains: canonicalDomains.map(displayDomain),
-    canonicalDomains,
-  });
-}
-
-function startCall(socket, payload = {}) {
-  const rl = rateLimit(`start-call:${socket.id}`, LIMITS.startCallPerMinute);
-  if (!rl.ok) return emitRateLimit(socket, "calls", rl);
-
-  const fromDomainRaw = String(payload.fromDomain || payload.from || "");
-  const toDomainRaw = String(payload.toDomain || payload.to || "");
-
-  const fromDomain = canonicalDomain(fromDomainRaw);
-  const toDomain = canonicalDomain(toDomainRaw);
-
-  if (!fromDomain || !toDomain) {
-    socket.emit("call-error", { message: "Missing fromDomain or toDomain." });
-    return;
-  }
-
-  if (fromDomain === toDomain) {
-    socket.emit("call-error", { message: "You cannot call the same identity." });
-    return;
-  }
-
-  if (!socketOwnsDomain(socket, fromDomain)) {
-    socket.emit("call-error", {
-      message: "Caller identity is not registered to this online wallet session.",
-    });
-    return;
-  }
-
-  const targets = onlineSocketsFor(toDomain);
-
-  if (!targets.length) {
-    socket.emit("call-error", {
-      message: `${displayDomain(toDomainRaw || toDomain)} is not online right now.`,
-      toDomain: displayDomain(toDomainRaw || toDomain),
-      toCanonical: toDomain,
-    });
-    return;
-  }
-
-  const callId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const room = makeRoom(fromDomain, toDomain);
-
-  const call = {
-    callId,
-    room,
-    fromSocketId: socket.id,
-    fromDomain: displayDomain(fromDomainRaw || fromDomain),
-    toDomain: displayDomain(toDomainRaw || toDomain),
-    fromCanonical: fromDomain,
-    toCanonical: toDomain,
-    targets,
-    createdAt: Date.now(),
+  return {
+    sockets: [],
+    matchedBy: "",
+    targetIdentity: Array.from(identityKeys)[0] || "",
+    targetWallet: Array.from(walletKeys)[0] || ""
   };
-
-  calls.set(callId, call);
-
-  socket.emit("call-ringing", {
-    callId,
-    room,
-    fromDomain: call.fromDomain,
-    toDomain: call.toDomain,
-    fromCanonical: call.fromCanonical,
-    toCanonical: call.toCanonical,
-  });
-
-  for (const targetSocketId of targets) {
-    const invitePayload = {
-      callId,
-      fromDomain: call.fromDomain,
-      toDomain: call.toDomain,
-      fromCanonical: call.fromCanonical,
-      toCanonical: call.toCanonical,
-      room,
-      mode: payload.mode || "video",
-      at: Date.now(),
-    };
-
-    io.to(targetSocketId).emit("incoming-call", invitePayload);
-    io.to(targetSocketId).emit("call-invite", invitePayload);
-  }
 }
 
-function acceptCall(socket, payload = {}) {
-  const call = calls.get(payload.callId);
-
-  if (!call) {
-    socket.emit("call-error", { message: "Call no longer exists." });
-    return;
-  }
-
-  if (!socketOwnsDomain(socket, call.toCanonical)) {
-    socket.emit("call-error", {
-      message: "This wallet session is not registered as the called identity.",
-    });
-    return;
-  }
-
-  socket.join(call.room);
-
-  const caller = io.sockets.sockets.get(call.fromSocketId);
-  if (caller) caller.join(call.room);
-
-  io.to(call.fromSocketId).emit("call-started", {
-    callId: call.callId,
-    room: call.room,
-    fromDomain: call.fromDomain,
-    toDomain: call.toDomain,
-    fromCanonical: call.fromCanonical,
-    toCanonical: call.toCanonical,
-    peerDomain: call.toDomain,
-    peerCanonical: call.toCanonical,
-    role: "caller",
-    at: Date.now(),
-  });
-
-  socket.emit("call-started", {
-    callId: call.callId,
-    room: call.room,
-    fromDomain: call.toDomain,
-    toDomain: call.fromDomain,
-    fromCanonical: call.toCanonical,
-    toCanonical: call.fromCanonical,
-    peerDomain: call.fromDomain,
-    peerCanonical: call.fromCanonical,
-    role: "callee",
-    at: Date.now(),
-  });
-
-  calls.delete(call.callId);
+function makeRoom(a, b) {
+  return [norm(a), norm(b)].sort().join("__");
 }
-
-function rejectCall(socket, payload = {}) {
-  const call = calls.get(payload.callId);
-  if (!call) return;
-
-  io.to(call.fromSocketId).emit("call-error", {
-    message: `${call.toDomain} declined the call.`,
-    callId: call.callId,
-    room: call.room,
-  });
-
-  calls.delete(call.callId);
-}
-
-function relayDomainMessage(socket, payload = {}) {
-  const rl = rateLimit(`message:${socket.id}`, LIMITS.messagePerMinute);
-  if (!rl.ok) return emitRateLimit(socket, "messages", rl);
-
-  const fromDomain = String(payload.fromDomain || payload.from || "");
-  const toDomain = String(payload.toDomain || payload.to || "");
-  const text = String(payload.text || payload.message || "").slice(0, LIMITS.maxTextLength);
-  const room = String(payload.room || makeRoom(fromDomain, toDomain));
-
-  if (!room || !text) return;
-
-  const messagePayload = {
-    fromDomain: displayDomain(fromDomain),
-    toDomain: displayDomain(toDomain),
-    fromCanonical: canonicalDomain(fromDomain),
-    toCanonical: canonicalDomain(toDomain),
-    text,
-    message: text,
-    room,
-    at: Date.now(),
-  };
-
-  socket.to(room).emit("domain-message", messagePayload);
-  socket.to(room).emit("chat-message", messagePayload);
-}
-
-function endChat(socket, payload = {}) {
-  const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
-  if (!room) return;
-
-  const endPayload = {
-    fromDomain: payload.fromDomain,
-    toDomain: payload.toDomain,
-    room,
-    at: Date.now(),
-  };
-
-  socket.to(room).emit("chat-ended", endPayload);
-  socket.to(room).emit("end-chat", endPayload);
-
-  socket.leave(room);
-}
-
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "aigen-domain-chat-signal-server",
-    version: "20260512-abuse-protected-merged-origins",
-  });
-});
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "aigen-domain-chat-signal-server",
-    version: "20260512-abuse-protected-merged-origins",
     onlineSockets: socketProfiles.size,
-    onlineDomains: domainSockets.size,
-    pendingCalls: calls.size,
-    allowedOrigins: allowAllOrigins ? ["*"] : allowedOrigins,
-    envAllowedOrigins: ENV_ALLOWED_ORIGINS,
-    defaultAllowedOrigins: DEFAULT_ALLOWED_ORIGINS,
-    limits: LIMITS,
+    onlineDomains: presenceByIdentity.size,
+    onlineIdentities: presenceByIdentity.size,
+    onlineWallets: presenceByWallet.size
   });
 });
 
 app.get("/presence/:domain", (req, res) => {
   const domain = req.params.domain;
-  const canonical = canonicalDomain(domain);
-
+  const result = resolvePresenceTarget({
+    domain,
+    identity: domain,
+    normalizedIdentity: domain,
+    wallet: domain,
+    ownerWallet: domain,
+    connectedWallet: domain
+  });
+  console.log("[AIGEN signal presence check]", {
+    targetIdentity: result.targetIdentity,
+    targetWallets: result.targetWallet ? [result.targetWallet] : [],
+    matchedBy: result.matchedBy,
+    online: result.sockets.length > 0
+  });
   res.json({
     ok: true,
-    domain: displayDomain(domain),
-    canonical,
-    online: onlineSocketsFor(canonical).length > 0,
-    sockets: onlineSocketsFor(canonical).length,
+    domain,
+    canonical: result.targetIdentity || normalizeIdentity(domain),
+    online: result.sockets.length > 0,
+    presenceStatus: result.sockets.length > 0 ? "online" : "offline",
+    matchedBy: result.matchedBy
   });
 });
 
-app.get("/debug/presence", (_req, res) => {
-  const domains = [];
-
-  for (const [domain, sockets] of domainSockets.entries()) {
-    domains.push({
-      domain: displayDomain(domain),
-      canonical: domain,
-      sockets: Array.from(sockets).filter((id) => io.sockets.sockets.has(id)).length,
-    });
-  }
-
-  res.json({
+function emitPresenceResult(socket, payload = {}, eventName = "presence-result") {
+  const result = resolvePresenceTarget(payload);
+  const response = {
     ok: true,
-    onlineSockets: socketProfiles.size,
-    onlineDomains: domains.length,
-    domains,
+    online: result.sockets.length > 0,
+    presenceStatus: result.sockets.length > 0 ? "online" : "offline",
+    matchedBy: result.matchedBy,
+    targetIdentity: result.targetIdentity,
+    targetWallet: result.targetWallet,
+    sockets: result.sockets.length
+  };
+  console.log("[AIGEN signal presence check]", {
+    targetIdentity: result.targetIdentity,
+    targetWallets: result.targetWallet ? [result.targetWallet] : [],
+    matchedBy: result.matchedBy,
+    online: response.online
   });
-});
-
-io.use((socket, next) => {
-  const origin = socket.handshake.headers.origin || "";
-
-  if (!isAllowedOrigin(origin)) {
-    console.warn("[SOCKET ORIGIN BLOCKED]", origin);
-    return next(new Error("origin_not_allowed"));
-  }
-
-  const ip = ipForSocket(socket);
-  const current = ipSockets.get(ip);
-
-  if (current && current.size >= LIMITS.maxConnectionsPerIp) {
-    console.warn("[SOCKET IP BLOCKED]", ip);
-    return next(new Error("too_many_connections"));
-  }
-
-  return next();
-});
+  socket.emit(eventName, response);
+}
 
 io.on("connection", (socket) => {
-  const ip = ipForSocket(socket);
+  function registerPresence(payload = {}) {
+    removeSocket(socket.id);
 
-  if (!ipSockets.has(ip)) ipSockets.set(ip, new Set());
-  ipSockets.get(ip).add(socket.id);
+    const domains = Array.from(new Set((payload.domains || []).map(String).filter(Boolean)));
+    const activeDomain = normalizeIdentity(payload.activeDomain || payload.selectedIdentity || payload.normalizedIdentity || domains[0] || "");
+    const wallet = normalizeWallet(payload.connectedWallet || payload.wallet || "");
+    const identityKeys = identityKeysFromPayload({ ...payload, activeDomain });
+    const walletKeys = walletKeysFromPayload(payload);
 
-  socket.emit("signal-ready", {
-    ok: true,
-    socketId: socket.id,
-    version: "20260512-abuse-protected-merged-origins",
-  });
-
-  socket.on("register-presence", (payload = {}) => registerPresence(socket, payload));
-
-  socket.on("join-identity", (payload = {}) => {
-    const identity = payload.identity || payload.activeDomain || payload.domain;
-    registerPresence(socket, {
-      wallet: payload.wallet || "",
-      activeDomain: identity,
-      domains: payload.domains && payload.domains.length ? payload.domains : [identity],
+    socketProfiles.set(socket.id, {
+      wallet,
+      activeDomain,
+      domains: identityKeys,
+      identityKeys,
+      walletKeys,
+      namespaceType: payload.namespaceType || ""
     });
-  });
 
-  socket.on("start-call", (payload = {}) => startCall(socket, payload));
+    for (const key of identityKeys) addPresence(presenceByIdentity, key, socket.id);
+    for (const key of walletKeys) addPresence(presenceByWallet, key, socket.id);
 
-  socket.on("call-invite", (payload = {}) => {
-    startCall(socket, {
-      fromDomain: payload.fromDomain || payload.from,
-      toDomain: payload.toDomain || payload.to,
-      mode: payload.mode || "video",
+    console.log("[AIGEN signal presence register]", {
+      socketId: socket.id,
+      identityKeys: Array.from(identityKeys),
+      walletKeys: Array.from(walletKeys),
+      namespaceType: payload.namespaceType || ""
     });
+
+    socket.emit("presence-registered", {
+      ok: true,
+      wallet,
+      activeDomain,
+      domains: Array.from(identityKeys),
+      identityKeys: Array.from(identityKeys),
+      walletKeys: Array.from(walletKeys)
+    });
+  }
+
+  socket.on("register-presence", registerPresence);
+  socket.on("join", registerPresence);
+  socket.on("identify", registerPresence);
+
+  socket.on("presence-check", (payload = {}) => emitPresenceResult(socket, payload, "presence-result"));
+  socket.on("check-presence", (payload = {}) => emitPresenceResult(socket, payload, "presence-result"));
+  socket.on("is-online", (payload = {}) => emitPresenceResult(socket, payload, "presence-result"));
+  socket.on("target-presence", (payload = {}) => emitPresenceResult(socket, payload, "target-presence-result"));
+  socket.on("lookup-presence", (payload = {}) => emitPresenceResult(socket, payload, "lookup-presence-result"));
+  socket.on("callee-online", (payload = {}) => emitPresenceResult(socket, payload, "callee-online-result"));
+
+  socket.on("start-call", (payload = {}) => {
+    const fromDomain = String(payload.fromDomain || "");
+    const toDomain = String(payload.toDomain || "");
+    const toIdentity = payload.toIdentity || {};
+    const fromIdentity = payload.fromIdentity || {};
+
+    if (!fromDomain || !toDomain) {
+      socket.emit("call-error", { message: "Missing fromDomain or toDomain." });
+      return;
+    }
+
+    if (norm(fromDomain) === norm(toDomain)) {
+      socket.emit("call-error", { message: "You cannot call the same domain identity." });
+      return;
+    }
+
+    const profile = socketProfiles.get(socket.id);
+    const fromKeys = identityKeysFromPayload({
+      ...fromIdentity,
+      domain: fromDomain,
+      identity: fromDomain,
+      normalizedIdentity: payload.normalizedFromIdentity || fromIdentity.normalizedIdentity
+    });
+    const callerRegistered = !!profile && Array.from(fromKeys).some((key) => profile.identityKeys?.has(key));
+    if (!callerRegistered) {
+      socket.emit("call-error", { message: "Caller domain is not registered to this online wallet session." });
+      return;
+    }
+
+    const target = resolvePresenceTarget({
+      ...toIdentity,
+      domain: toDomain,
+      identity: toDomain,
+      normalizedIdentity: payload.normalizedToIdentity || toIdentity.normalizedIdentity,
+      ownerWallet: toIdentity.ownerWallet || payload.ownerWallet,
+      resolvedWallet: toIdentity.resolvedWallet || payload.resolvedWallet,
+      connectedWallet: payload.targetConnectedWallet || "",
+      wallet: payload.wallet
+    });
+    const targets = target.sockets.filter((id) => id !== socket.id);
+    console.log("[AIGEN signal route target]", {
+      targetIdentity: target.targetIdentity || normalizeIdentity(toDomain),
+      targetWallet: target.targetWallet,
+      resolvedSocketId: targets[0] || "",
+      matchedBy: target.matchedBy
+    });
+    if (!targets.length) {
+      socket.emit("call-error", { message: `${toDomain} has no active signal session right now.` });
+      return;
+    }
+
+    const callId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const room = makeRoom(fromDomain, toDomain);
+    calls.set(callId, { callId, room, fromSocketId: socket.id, fromDomain, toDomain, targets, payload });
+
+    for (const targetSocketId of targets) {
+      io.to(targetSocketId).emit("incoming-call", { ...payload, callId, fromDomain, toDomain, room });
+    }
   });
 
-  socket.on("accept-call", (payload = {}) => acceptCall(socket, payload));
-  socket.on("reject-call", (payload = {}) => rejectCall(socket, payload));
-  socket.on("domain-message", (payload = {}) => relayDomainMessage(socket, payload));
-  socket.on("chat-message", (payload = {}) => relayDomainMessage(socket, payload));
-  socket.on("end-chat", (payload = {}) => endChat(socket, payload));
+  socket.on("accept-call", (payload = {}) => {
+    const call = calls.get(payload.callId);
+    if (!call) {
+      socket.emit("call-error", { message: "Call no longer exists." });
+      return;
+    }
+
+    socket.join(call.room);
+    const caller = io.sockets.sockets.get(call.fromSocketId);
+    if (caller) caller.join(call.room);
+
+    io.to(call.fromSocketId).emit("call-started", {
+      ...(call.payload || {}),
+      room: call.room,
+      fromDomain: call.fromDomain,
+      toDomain: call.toDomain,
+      peerDomain: call.toDomain
+    });
+
+    socket.emit("call-started", {
+      ...(call.payload || {}),
+      room: call.room,
+      fromDomain: call.toDomain,
+      toDomain: call.fromDomain,
+      peerDomain: call.fromDomain
+    });
+
+    calls.delete(call.callId);
+  });
+
+  socket.on("reject-call", (payload = {}) => {
+    const call = calls.get(payload.callId);
+    if (!call) return;
+    io.to(call.fromSocketId).emit("call-error", { message: `${call.toDomain} declined the chat.` });
+    calls.delete(call.callId);
+  });
+
+  socket.on("domain-message", (payload = {}) => {
+    const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
+    const fromDomain = String(payload.fromDomain || "");
+    const toDomain = String(payload.toDomain || "");
+    const text = String(payload.text || "").slice(0, 4000);
+
+    if (!fromDomain || !toDomain || !text) return;
+
+    const target = resolvePresenceTarget({
+      ...(payload.toIdentity || {}),
+      domain: toDomain,
+      identity: toDomain,
+      normalizedIdentity: payload.normalizedToIdentity || payload.toIdentity?.normalizedIdentity,
+      ownerWallet: payload.toIdentity?.ownerWallet || payload.ownerWallet,
+      resolvedWallet: payload.toIdentity?.resolvedWallet || payload.resolvedWallet,
+      connectedWallet: payload.targetConnectedWallet || "",
+      wallet: payload.wallet
+    });
+    console.log("[AIGEN signal route target]", {
+      targetIdentity: target.targetIdentity || normalizeIdentity(toDomain),
+      targetWallet: target.targetWallet,
+      resolvedSocketId: target.sockets[0] || "",
+      matchedBy: target.matchedBy
+    });
+
+    const message = { ...payload, fromDomain, toDomain, text, room, at: Date.now() };
+    socket.to(room).emit("domain-message", message);
+    for (const targetSocketId of target.sockets) {
+      if (targetSocketId !== socket.id) io.to(targetSocketId).emit("domain-message", message);
+    }
+  });
 
   socket.on("webrtc-signal", (payload = {}) => {
-    const rl = rateLimit(`webrtc:${socket.id}`, LIMITS.webrtcSignalPerMinute);
-    if (!rl.ok) return emitRateLimit(socket, "webrtc", rl);
-
-    const room = String(payload.room || "");
-    const data = payload.data;
-
-    if (!room || !data) return;
-
-    socket.to(room).emit("webrtc-signal", {
-      room,
-      data,
-      fromDomain: payload.fromDomain,
-      at: Date.now(),
-    });
+    const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
+    if (!room) return;
+    socket.to(room).emit("webrtc-signal", { ...payload, room });
   });
 
   socket.on("video-toggle", (payload = {}) => {
-    const rl = rateLimit(`video-toggle:${socket.id}`, LIMITS.videoTogglePerMinute);
-    if (!rl.ok) return emitRateLimit(socket, "video-toggle", rl);
-
-    const room = String(payload.room || "");
+    const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
     if (!room) return;
-
-    socket.to(room).emit("video-toggle", {
-      room,
-      fromDomain: displayDomain(payload.fromDomain || ""),
-      fromCanonical: canonicalDomain(payload.fromDomain || ""),
-      enabled: !!payload.enabled,
-      at: Date.now(),
-    });
+    socket.to(room).emit("video-toggle", { ...payload, room });
   });
 
-  socket.on("disconnect", () => removeSocket(socket.id));
+  socket.on("end-chat", (payload = {}) => {
+    const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
+    socket.to(room).emit("chat-ended", {
+      fromDomain: payload.fromDomain,
+      toDomain: payload.toDomain,
+      room
+    });
+    socket.leave(room);
+  });
+
+  socket.on("disconnect", () => {
+    removeSocket(socket.id);
+  });
 });
-
-setInterval(() => {
-  const now = Date.now();
-
-  for (const [callId, call] of calls.entries()) {
-    if (now - call.createdAt > LIMITS.pendingCallTtlMs) {
-      calls.delete(callId);
-      io.to(call.fromSocketId).emit("call-error", {
-        message: "Call expired with no answer.",
-        callId,
-        room: call.room,
-      });
-    }
-  }
-
-  for (const [key, bucket] of buckets.entries()) {
-    if (now >= bucket.resetAt + 60000) buckets.delete(key);
-  }
-}, 30000);
 
 server.listen(PORT, () => {
   console.log(`AIGEN signal server listening on :${PORT}`);
-  console.log("Allowed origins:", allowAllOrigins ? "*" : allowedOrigins.join(", "));
-  console.log("Env origins:", ENV_ALLOWED_ORIGINS.join(", ") || "(none)");
 });
