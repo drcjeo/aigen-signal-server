@@ -32,6 +32,7 @@ const socketProfiles = new Map(); // socket.id -> { wallet, activeDomain, identi
 const presenceByIdentity = new Map(); // normalized identity -> Set(socket.id)
 const presenceByWallet = new Map();   // normalized wallet -> Set(socket.id)
 const calls = new Map();          // callId -> call
+const PRESENCE_DEBUG_KEYS_ENABLED = String(process.env.AIGEN_PRESENCE_DEBUG || "").toLowerCase() === "1";
 
 function normalizeIdentity(value) {
   return String(value || "")
@@ -99,6 +100,12 @@ function identityKeysFromPayload(payload = {}) {
     keys.add(normalizeIdentity(identity?.identity));
     keys.add(normalizeIdentity(identity?.name));
   }
+  for (const identity of payload.identityPackets || []) {
+    keys.add(normalizeIdentity(identity?.normalizedIdentity));
+    keys.add(normalizeIdentity(identity?.identity));
+    keys.add(normalizeIdentity(identity?.name));
+    keys.add(normalizeIdentity(identity?.domain));
+  }
 
   return keys;
 }
@@ -127,6 +134,13 @@ function walletKeysFromPayload(payload = {}) {
     keys.add(normalizeWallet(identity?.ownerWallet));
     keys.add(normalizeWallet(identity?.resolvedWallet));
     keys.add(normalizeWallet(identity?.connectedWallet));
+    for (const wallet of identity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
+  }
+  for (const identity of payload.identityPackets || []) {
+    keys.add(normalizeWallet(identity?.ownerWallet));
+    keys.add(normalizeWallet(identity?.resolvedWallet));
+    keys.add(normalizeWallet(identity?.connectedWallet));
+    keys.add(normalizeWallet(identity?.wallet));
     for (const wallet of identity?.resolvedWallets || []) keys.add(normalizeWallet(wallet));
   }
 
@@ -159,19 +173,38 @@ function resolvePresenceTarget(payload = {}) {
 
   for (const key of identityKeys) {
     const sockets = onlineSocketsFromMap(presenceByIdentity, key);
-    if (sockets.length) return { sockets, matchedBy: "identity", targetIdentity: key, targetWallet: "" };
+    if (sockets.length) return {
+      sockets,
+      matchedBy: "identity",
+      matchedKey: key,
+      targetIdentity: key,
+      targetWallet: "",
+      identityCandidates: Array.from(identityKeys),
+      walletCandidates: Array.from(walletKeys)
+    };
   }
 
   for (const key of walletKeys) {
     const sockets = onlineSocketsFromMap(presenceByWallet, key);
-    if (sockets.length) return { sockets, matchedBy: "wallet", targetIdentity: Array.from(identityKeys)[0] || "", targetWallet: key };
+    if (sockets.length) return {
+      sockets,
+      matchedBy: "wallet",
+      matchedKey: key,
+      targetIdentity: Array.from(identityKeys)[0] || "",
+      targetWallet: key,
+      identityCandidates: Array.from(identityKeys),
+      walletCandidates: Array.from(walletKeys)
+    };
   }
 
   return {
     sockets: [],
     matchedBy: "",
+    matchedKey: "",
     targetIdentity: Array.from(identityKeys)[0] || "",
-    targetWallet: Array.from(walletKeys)[0] || ""
+    targetWallet: Array.from(walletKeys)[0] || "",
+    identityCandidates: Array.from(identityKeys),
+    walletCandidates: Array.from(walletKeys)
   };
 }
 
@@ -202,8 +235,10 @@ app.get("/presence/:domain", (req, res) => {
   });
   console.log("[AIGEN signal presence check]", {
     targetIdentity: result.targetIdentity,
-    targetWallets: result.targetWallet ? [result.targetWallet] : [],
+    identityCandidates: result.identityCandidates,
+    walletCandidates: result.walletCandidates,
     matchedBy: result.matchedBy,
+    matchedKey: result.matchedKey,
     online: result.sockets.length > 0
   });
   res.json({
@@ -213,7 +248,9 @@ app.get("/presence/:domain", (req, res) => {
     online: result.sockets.length > 0,
     presenceStatus: result.sockets.length > 0 ? "online" : "offline",
     matchedBy: result.matchedBy,
-    matchedKey: result.matchedBy === "wallet" ? result.targetWallet : (result.matchedBy === "identity" ? result.targetIdentity : "")
+    matchedKey: result.matchedKey,
+    identityCandidates: result.identityCandidates,
+    walletCandidates: result.walletCandidates
   });
 });
 
@@ -224,15 +261,19 @@ function emitPresenceResult(socket, payload = {}, eventName = "presence-result")
     online: result.sockets.length > 0,
     presenceStatus: result.sockets.length > 0 ? "online" : "offline",
     matchedBy: result.matchedBy,
-    matchedKey: result.matchedBy === "wallet" ? result.targetWallet : (result.matchedBy === "identity" ? result.targetIdentity : ""),
+    matchedKey: result.matchedKey,
     targetIdentity: result.targetIdentity,
     targetWallet: result.targetWallet,
+    identityCandidates: result.identityCandidates,
+    walletCandidates: result.walletCandidates,
     sockets: result.sockets.length
   };
   console.log("[AIGEN signal presence check]", {
     targetIdentity: result.targetIdentity,
-    targetWallets: result.targetWallet ? [result.targetWallet] : [],
+    identityCandidates: result.identityCandidates,
+    walletCandidates: result.walletCandidates,
     matchedBy: result.matchedBy,
+    matchedKey: result.matchedKey,
     online: response.online
   });
   socket.emit(eventName, response);
@@ -266,9 +307,11 @@ io.on("connection", (socket) => {
 
     console.log("[AIGEN signal presence register]", {
       socketId: socket.id,
+      connectedWallet: wallet,
       identityKeys: Array.from(identityKeys),
       walletKeys: Array.from(walletKeys),
-      namespaceType: payload.namespaceType || ""
+      namespaceType: payload.namespaceType || "",
+      rawPayload: payload
     });
 
     socket.emit("presence-registered", {
@@ -291,6 +334,35 @@ io.on("connection", (socket) => {
   socket.on("target-presence", (payload = {}) => emitPresenceResult(socket, payload, "target-presence-result"));
   socket.on("lookup-presence", (payload = {}) => emitPresenceResult(socket, payload, "lookup-presence-result"));
   socket.on("callee-online", (payload = {}) => emitPresenceResult(socket, payload, "callee-online-result"));
+  socket.on("presence-debug", (payload = {}) => {
+    const queryIdentity = normalizeIdentity(payload.identity || payload.name || payload.domain || payload.normalizedIdentity || "");
+    const queryWallet = normalizeWallet(payload.wallet || payload.ownerWallet || payload.resolvedWallet || "");
+    const result = resolvePresenceTarget({
+      ...payload,
+      normalizedIdentity: queryIdentity || payload.normalizedIdentity,
+      identity: queryIdentity || payload.identity,
+      domain: queryIdentity || payload.domain,
+      ownerWallet: queryWallet || payload.ownerWallet,
+      resolvedWallet: queryWallet || payload.resolvedWallet,
+      wallet: queryWallet || payload.wallet
+    });
+    const response = {
+      ok: true,
+      socketCount: socketProfiles.size,
+      queryIdentity,
+      queryWallet,
+      online: result.sockets.length > 0,
+      matchedBy: result.matchedBy,
+      matchedKey: result.matchedKey,
+      identityCandidates: result.identityCandidates,
+      walletCandidates: result.walletCandidates
+    };
+    if (PRESENCE_DEBUG_KEYS_ENABLED) {
+      response.identityKeys = Array.from(presenceByIdentity.keys());
+      response.walletKeys = Array.from(presenceByWallet.keys());
+    }
+    socket.emit("presence-debug-result", response);
+  });
 
   socket.on("start-call", (payload = {}) => {
     const callerIdentity = normalizeIdentity(
@@ -374,7 +446,7 @@ io.on("connection", (socket) => {
       wallet: targetWallet || payload.wallet
     });
     const targets = target.sockets.filter((id) => id !== socket.id);
-    const matchedKey = target.matchedBy === "wallet" ? target.targetWallet : (target.matchedBy === "identity" ? target.targetIdentity : "");
+    const matchedKey = target.matchedKey;
     console.log("[AIGEN signal target resolved]", {
       targetIdentity: target.targetIdentity || normalizeIdentity(toDomain),
       targetWallet: target.targetWallet,
