@@ -32,6 +32,7 @@ const socketProfiles = new Map(); // socket.id -> { wallet, activeDomain, identi
 const presenceByIdentity = new Map(); // normalized identity -> Set(socket.id)
 const presenceByWallet = new Map();   // normalized wallet -> Set(socket.id)
 const calls = new Map();          // callId -> call
+const activeCalls = new Map();    // callId -> active call sockets
 const PRESENCE_DEBUG_KEYS_ENABLED = String(process.env.AIGEN_PRESENCE_DEBUG || "").toLowerCase() === "1";
 
 function normalizeIdentity(value) {
@@ -537,6 +538,14 @@ io.on("connection", (socket) => {
     socket.join(call.room);
     const caller = io.sockets.sockets.get(call.fromSocketId);
     if (caller) caller.join(call.room);
+    activeCalls.set(call.callId, {
+      callId: call.callId,
+      room: call.room,
+      callerSocketId: call.fromSocketId,
+      calleeSocketId: socket.id,
+      callerIdentity: call.callerIdentity,
+      targetIdentity: call.targetIdentity
+    });
 
     console.log("[AIGEN signal call accepted]", {
       callId: call.callId,
@@ -634,14 +643,69 @@ io.on("connection", (socket) => {
   });
 
   socket.on("webrtc-signal", (payload = {}) => {
+    const callId = String(payload.callId || "");
+    const type = payload.data?.type || payload.type || "";
+    const hasSdp = !!(payload.data?.sdp || payload.sdp);
+    const hasCandidate = !!(payload.data?.candidate || payload.candidate);
+    console.log("[AIGEN signal webrtc received]", {
+      socketId: socket.id,
+      callId,
+      type,
+      hasSdp,
+      hasCandidate
+    });
+    const call = callId ? (activeCalls.get(callId) || calls.get(callId)) : null;
+    if (call) {
+      const callerSocketId = call.callerSocketId || call.fromSocketId;
+      const calleeSocketId = call.calleeSocketId || call.acceptedSocketId || "";
+      const toSocketId = socket.id === callerSocketId
+        ? calleeSocketId
+        : (socket.id === calleeSocketId ? callerSocketId : "");
+      if (toSocketId && toSocketId !== socket.id) {
+        io.to(toSocketId).emit("webrtc-signal", {
+          ...payload,
+          callId,
+          fromSocketId: socket.id
+        });
+        console.log("[AIGEN signal webrtc routed]", {
+          callId,
+          fromSocketId: socket.id,
+          toSocketId,
+          type,
+          routeMode: "callId"
+        });
+        return;
+      }
+      console.log("[AIGEN signal webrtc route failed]", {
+        callId,
+        reason: "sender_not_in_call_or_missing_peer",
+        payloadKeys: Object.keys(payload || {})
+      });
+      return;
+    }
+
     const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
-    if (!room) return;
+    if (!room) {
+      console.log("[AIGEN signal webrtc route failed]", {
+        callId,
+        reason: "missing_callId_and_room",
+        payloadKeys: Object.keys(payload || {})
+      });
+      return;
+    }
+    socket.to(room).emit("webrtc-signal", { ...payload, room });
+    console.log("[AIGEN signal webrtc routed]", {
+      callId,
+      fromSocketId: socket.id,
+      toSocketId: "",
+      type,
+      routeMode: "target"
+    });
     console.log("[AIGEN signal webrtc relay]", {
       socketId: socket.id,
       room,
-      type: payload.data?.type || ""
+      type
     });
-    socket.to(room).emit("webrtc-signal", { ...payload, room });
   });
 
   socket.on("video-toggle", (payload = {}) => {
@@ -651,6 +715,8 @@ io.on("connection", (socket) => {
   });
 
   function endChat(payload = {}) {
+    const callId = String(payload.callId || "");
+    if (callId) activeCalls.delete(callId);
     const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
     socket.to(room).emit("chat-ended", {
       fromDomain: payload.fromDomain,
@@ -664,6 +730,9 @@ io.on("connection", (socket) => {
   socket.on("end-call", endChat);
 
   socket.on("disconnect", () => {
+    for (const [callId, call] of activeCalls.entries()) {
+      if (call.callerSocketId === socket.id || call.calleeSocketId === socket.id) activeCalls.delete(callId);
+    }
     removeSocket(socket.id);
   });
 });
