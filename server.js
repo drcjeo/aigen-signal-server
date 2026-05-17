@@ -239,6 +239,10 @@ function emitPresenceResult(socket, payload = {}, eventName = "presence-result")
 }
 
 io.on("connection", (socket) => {
+  console.log("[AIGEN signal socket connected]", {
+    socketId: socket.id
+  });
+
   function registerPresence(payload = {}) {
     removeSocket(socket.id);
 
@@ -289,14 +293,47 @@ io.on("connection", (socket) => {
   socket.on("callee-online", (payload = {}) => emitPresenceResult(socket, payload, "callee-online-result"));
 
   socket.on("start-call", (payload = {}) => {
-    const fromDomain = String(payload.fromDomain || "");
-    const toDomain = String(payload.toDomain || "");
+    const callerIdentity = normalizeIdentity(
+      payload.callerIdentity
+      || payload.fromIdentity
+      || payload.primaryIdentity
+      || payload.selectedIdentity
+      || payload.normalizedIdentity
+      || payload.domain
+      || payload.fromDomain
+    );
+    const targetIdentity = normalizeIdentity(
+      payload.targetIdentity
+      || payload.toIdentity
+      || payload.calleeIdentity
+      || payload.to
+      || payload.callee
+      || payload.target
+      || payload.toDomain
+    );
+    const targetWallet = normalizeWallet(
+      payload.targetWallet
+      || payload.resolvedWallet
+      || payload.ownerWallet
+      || payload.toWallet
+    );
+    const callerWallet = normalizeWallet(payload.callerWallet || payload.connectedWallet || payload.wallet || "");
+    const fromDomain = String(payload.fromDomain || callerIdentity || "");
+    const toDomain = String(payload.toDomain || targetIdentity || "");
     const toIdentity = (payload.toIdentity && typeof payload.toIdentity === "object")
       ? payload.toIdentity
       : ((payload.targetIdentityPacket && typeof payload.targetIdentityPacket === "object") ? payload.targetIdentityPacket : {});
     const fromIdentity = (payload.fromIdentity && typeof payload.fromIdentity === "object")
       ? payload.fromIdentity
       : ((payload.callerIdentityPacket && typeof payload.callerIdentityPacket === "object") ? payload.callerIdentityPacket : {});
+
+    console.log("[AIGEN signal start-call received]", {
+      socketId: socket.id,
+      callerIdentity,
+      targetIdentity,
+      targetWallet,
+      media: payload.media || payload.mode || "video"
+    });
 
     if (!fromDomain || !toDomain) {
       socket.emit("call-error", { message: "Missing fromDomain or toDomain." });
@@ -326,73 +363,164 @@ io.on("connection", (socket) => {
       domain: toDomain,
       identity: toDomain,
       normalizedIdentity: payload.normalizedToIdentity || toIdentity.normalizedIdentity,
-      targetIdentity: payload.targetIdentity,
-      calleeIdentity: payload.calleeIdentity,
+      targetIdentity: targetIdentity || payload.targetIdentity,
+      calleeIdentity: targetIdentity || payload.calleeIdentity,
       to: payload.to,
       target: payload.target,
       callee: payload.callee,
-      ownerWallet: toIdentity.ownerWallet || payload.ownerWallet,
-      resolvedWallet: toIdentity.resolvedWallet || payload.targetIdentityPacket?.resolvedWallet || payload.resolvedWallet || payload.targetWallet,
+      ownerWallet: toIdentity.ownerWallet || payload.ownerWallet || targetWallet,
+      resolvedWallet: toIdentity.resolvedWallet || payload.targetIdentityPacket?.resolvedWallet || payload.resolvedWallet || payload.targetWallet || targetWallet,
       connectedWallet: payload.targetConnectedWallet || "",
-      wallet: payload.wallet
+      wallet: targetWallet || payload.wallet
     });
     const targets = target.sockets.filter((id) => id !== socket.id);
-    console.log("[AIGEN signal route target]", {
+    const matchedKey = target.matchedBy === "wallet" ? target.targetWallet : (target.matchedBy === "identity" ? target.targetIdentity : "");
+    console.log("[AIGEN signal target resolved]", {
       targetIdentity: target.targetIdentity || normalizeIdentity(toDomain),
       targetWallet: target.targetWallet,
       resolvedSocketId: targets[0] || "",
-      matchedBy: target.matchedBy
+      matchedBy: target.matchedBy,
+      matchedKey
     });
     if (!targets.length) {
-      socket.emit("call-error", { message: `${toDomain} has no active signal session right now.` });
+      socket.emit("call-unavailable", {
+        ok: false,
+        reason: "offline",
+        targetIdentity: targetIdentity || toDomain
+      });
       return;
     }
 
     const callId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const room = makeRoom(fromDomain, toDomain);
-    calls.set(callId, { callId, room, fromSocketId: socket.id, fromDomain, toDomain, targets, payload });
+    calls.set(callId, {
+      callId,
+      room,
+      fromSocketId: socket.id,
+      calleeSocketIds: targets,
+      acceptedSocketId: "",
+      fromDomain,
+      toDomain,
+      callerIdentity,
+      targetIdentity: targetIdentity || target.targetIdentity || normalizeIdentity(toDomain),
+      callerWallet,
+      targetWallet: targetWallet || target.targetWallet,
+      matchedBy: target.matchedBy,
+      matchedKey,
+      payload
+    });
+
+    socket.emit("call-ringing", {
+      callId,
+      room,
+      targetIdentity: targetIdentity || target.targetIdentity || normalizeIdentity(toDomain),
+      targetWallet: targetWallet || target.targetWallet,
+      matchedBy: target.matchedBy,
+      matchedKey
+    });
 
     for (const targetSocketId of targets) {
-      io.to(targetSocketId).emit("incoming-call", { ...payload, callId, fromDomain, toDomain, room });
+      const invite = {
+        ...payload,
+        callId,
+        callerSocketId: socket.id,
+        callerIdentity,
+        fromIdentity: callerIdentity,
+        primaryIdentity: callerIdentity,
+        callerWallet,
+        targetIdentity: targetIdentity || target.targetIdentity || normalizeIdentity(toDomain),
+        toIdentity: targetIdentity || target.targetIdentity || normalizeIdentity(toDomain),
+        targetWallet: targetWallet || target.targetWallet,
+        fromDomain,
+        toDomain,
+        room,
+        media: payload.media || payload.mode || "video",
+        wantsVideo: payload.wantsVideo !== false,
+        wantsAudio: payload.wantsAudio !== false
+      };
+      io.to(targetSocketId).emit("incoming-call", invite);
+      console.log("[AIGEN signal incoming-call emitted]", {
+        callId,
+        callerIdentity,
+        targetIdentity: invite.targetIdentity,
+        targetSocketId,
+        matchedBy: target.matchedBy,
+        matchedKey
+      });
     }
   });
 
-  socket.on("accept-call", (payload = {}) => {
+  function acceptCall(payload = {}) {
     const call = calls.get(payload.callId);
     if (!call) {
       socket.emit("call-error", { message: "Call no longer exists." });
       return;
     }
+    if (!call.calleeSocketIds.includes(socket.id)) {
+      socket.emit("call-error", { message: "Only the invited callee can accept this call." });
+      return;
+    }
 
+    call.acceptedSocketId = socket.id;
     socket.join(call.room);
     const caller = io.sockets.sockets.get(call.fromSocketId);
     if (caller) caller.join(call.room);
 
-    io.to(call.fromSocketId).emit("call-started", {
+    console.log("[AIGEN signal call accepted]", {
+      callId: call.callId,
+      callerSocketId: call.fromSocketId,
+      calleeSocketId: socket.id
+    });
+
+    io.to(call.fromSocketId).emit("call-accepted", {
       ...(call.payload || {}),
+      callId: call.callId,
       room: call.room,
       fromDomain: call.fromDomain,
       toDomain: call.toDomain,
-      peerDomain: call.toDomain
+      peerDomain: call.toDomain,
+      callerIdentity: call.callerIdentity,
+      targetIdentity: call.targetIdentity,
+      role: "caller"
     });
 
-    socket.emit("call-started", {
+    socket.emit("call-accepted", {
       ...(call.payload || {}),
+      callId: call.callId,
       room: call.room,
       fromDomain: call.toDomain,
       toDomain: call.fromDomain,
-      peerDomain: call.fromDomain
+      peerDomain: call.fromDomain,
+      callerIdentity: call.callerIdentity,
+      targetIdentity: call.targetIdentity,
+      role: "callee"
     });
 
     calls.delete(call.callId);
-  });
+  }
 
-  socket.on("reject-call", (payload = {}) => {
+  socket.on("accept-call", acceptCall);
+  socket.on("call-accept", acceptCall);
+
+  function declineCall(payload = {}) {
     const call = calls.get(payload.callId);
     if (!call) return;
-    io.to(call.fromSocketId).emit("call-error", { message: `${call.toDomain} declined the chat.` });
+    console.log("[AIGEN signal call declined]", {
+      callId: call.callId,
+      callerSocketId: call.fromSocketId,
+      calleeSocketId: socket.id
+    });
+    io.to(call.fromSocketId).emit("call-declined", {
+      callId: call.callId,
+      targetIdentity: call.targetIdentity,
+      toDomain: call.toDomain
+    });
     calls.delete(call.callId);
-  });
+  }
+
+  socket.on("decline-call", declineCall);
+  socket.on("call-decline", declineCall);
+  socket.on("reject-call", declineCall);
 
   socket.on("domain-message", (payload = {}) => {
     const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
@@ -436,6 +564,11 @@ io.on("connection", (socket) => {
   socket.on("webrtc-signal", (payload = {}) => {
     const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
     if (!room) return;
+    console.log("[AIGEN signal webrtc relay]", {
+      socketId: socket.id,
+      room,
+      type: payload.data?.type || ""
+    });
     socket.to(room).emit("webrtc-signal", { ...payload, room });
   });
 
@@ -445,7 +578,7 @@ io.on("connection", (socket) => {
     socket.to(room).emit("video-toggle", { ...payload, room });
   });
 
-  socket.on("end-chat", (payload = {}) => {
+  function endChat(payload = {}) {
     const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
     socket.to(room).emit("chat-ended", {
       fromDomain: payload.fromDomain,
@@ -453,7 +586,10 @@ io.on("connection", (socket) => {
       room
     });
     socket.leave(room);
-  });
+  }
+
+  socket.on("end-chat", endChat);
+  socket.on("end-call", endChat);
 
   socket.on("disconnect", () => {
     removeSocket(socket.id);
