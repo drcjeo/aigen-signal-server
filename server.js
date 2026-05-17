@@ -9,6 +9,11 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+if (!allowedOrigins.includes("*")) {
+  for (const origin of ["https://chat.aigen.domains", "https://aigen.domains"]) {
+    if (!allowedOrigins.includes(origin)) allowedOrigins.push(origin);
+  }
+}
 
 const app = express();
 app.use(express.json());
@@ -23,9 +28,14 @@ app.use(cors({
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins.includes("*") ? "*" : allowedOrigins,
+    origin: (origin, cb) => {
+      if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
+    methods: ["GET", "POST"],
     credentials: true
-  }
+  },
+  transports: ["websocket", "polling"]
 });
 
 const socketProfiles = new Map(); // socket.id -> { wallet, activeDomain, identityKeys:Set, walletKeys:Set }
@@ -684,26 +694,15 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const room = String(payload.room || makeRoom(payload.fromDomain, payload.toDomain));
-    if (!room) {
-      console.log("[AIGEN signal webrtc route failed]", {
-        callId,
-        reason: "missing_callId_and_room",
-        payloadKeys: Object.keys(payload || {})
-      });
-      return;
-    }
-    socket.to(room).emit("webrtc-signal", { ...payload, room });
-    console.log("[AIGEN signal webrtc routed]", {
+    console.log("[AIGEN signal webrtc route failed]", {
       callId,
-      fromSocketId: socket.id,
-      toSocketId: "",
-      type,
-      routeMode: "target"
+      reason: "missing_active_call_mapping",
+      payloadKeys: Object.keys(payload || {})
     });
-    console.log("[AIGEN signal webrtc relay]", {
-      socketId: socket.id,
-      room,
+    socket.emit("webrtc-route-failed", {
+      ok: false,
+      callId,
+      reason: "missing_active_call_mapping",
       type
     });
   });
