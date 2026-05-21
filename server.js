@@ -9,31 +9,42 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-if (!allowedOrigins.includes("*")) {
-  for (const origin of ["https://chat.aigen.domains", "https://aigen.domains"]) {
-    if (!allowedOrigins.includes(origin)) allowedOrigins.push(origin);
-  }
+
+function addAllowedOrigin(origin) {
+  if (!allowedOrigins.includes(origin)) allowedOrigins.push(origin);
 }
 
-const app = express();
-app.use(express.json());
-app.use(cors({
+if (!allowedOrigins.includes("*")) {
+  for (const origin of [
+    "https://chat.aigen.domains",
+    "https://aigen.domains",
+    "https://vcard.paybydomain.ai",
+    "https://www.vcard.paybydomain.ai"
+  ]) {
+    addAllowedOrigin(origin);
+  }
+}
+console.log("[AIGEN signal allowed origins]", allowedOrigins);
+
+const corsOptions = {
   origin: (origin, cb) => {
     if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(null, false);
   },
   credentials: true
-}));
+};
+
+const app = express();
+app.use(express.json());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: (origin, cb) => {
-      if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(null, false);
-    },
+    origin: corsOptions.origin,
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: corsOptions.credentials
   },
   transports: ["websocket", "polling"]
 });
